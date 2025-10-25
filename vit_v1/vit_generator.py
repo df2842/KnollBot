@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 NUM_EPOCHS = 16
 NUM_WORKERS = 6
 
