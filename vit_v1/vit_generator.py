@@ -11,9 +11,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import autocast, GradScaler
 import warnings
 from transformers import ViTModel
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
-BATCH_SIZE = 64
-NUM_EPOCHS = 32
+BATCH_SIZE = 8
+NUM_EPOCHS = 16
 NUM_WORKERS = 6
 
 IMAGE_SIZE = 518
@@ -60,7 +63,7 @@ class ImagePairDataset(Dataset):
         return messy_image, neat_image
 
 class ViT(nn.Module):
-    def __init__(self, vit_model_name='facebook/dinov2-large'):
+    def __init__(self, vit_model_name='facebook/dinov2-base'):
         super().__init__()
 
         self.vit = ViTModel.from_pretrained(vit_model_name)
@@ -118,10 +121,24 @@ class WeightedL1Loss(nn.Module):
         return loss.mean()
 
 if __name__ == '__main__':
-    all_files = sorted([f for f in os.listdir(MESSY_DIR) if os.path.isfile(os.path.join(MESSY_DIR, f))])
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
 
-    train_files, temp_files = train_test_split(all_files, test_size=0.2, random_state=42)
-    val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=42)
+    if local_rank == 0:
+        all_files = sorted([f for f in os.listdir(MESSY_DIR) if os.path.isfile(os.path.join(MESSY_DIR, f))])
+        train_files, temp_files = train_test_split(all_files, test_size=0.2, random_state=42)
+        val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=42)
+    else:
+        train_files, val_files, test_files = [], [], []
+
+    dist.barrier()
+
+    dist.broadcast_object_list(train_files, src=0)
+    dist.broadcast_object_list(val_files, src=0)
+    dist.broadcast_object_list(test_files, src=0)
 
     transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -133,27 +150,33 @@ if __name__ == '__main__':
     val_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=val_files, transform=transform)
     test_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=test_files, transform=transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    test_sampler = DistributedSampler(test_dataset, shuffle=False)
 
-    device = torch.device("cuda")
-    model = ViT().to(device).to(device)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, sampler=train_sampler, shuffle=False, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, sampler=val_sampler, shuffle=False, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, sampler=test_sampler, shuffle=False, pin_memory=True)
+
+    model = ViT().to(device)
+    model = DDP(model, device_ids=[local_rank])
     criterion = WeightedL1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=LR)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=OPTIMIZER_PATIENCE, factor=OPTIMIZER_FACTOR)
     scaler = GradScaler()
     best_val_loss = float('inf')
 
-    print(f"\nStarting training on {device}...")
+    if local_rank == 0:
+        print(f"\nStarting training on {world_size} GPUs...")
 
     for epoch in range(NUM_EPOCHS):
+        train_sampler.set_epoch(epoch)
         model.train()
         running_train_loss = 0.0
-        train_progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Training]")
+        train_progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Training]", disable=(local_rank != 0))
 
         for messy_imgs, neat_imgs in train_progress_bar:
-            messy_imgs, neat_imgs = messy_imgs.to(device), neat_imgs.to(device)
+            messy_imgs, neat_imgs = messy_imgs.to(device, non_blocking=True), neat_imgs.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
             with autocast():
@@ -165,47 +188,73 @@ if __name__ == '__main__':
             scaler.update()
 
             running_train_loss += loss.item()
-            train_progress_bar.set_postfix({'train_loss': running_train_loss / (train_progress_bar.n + 1)})
+            if local_rank == 0:
+                train_progress_bar.set_postfix({'train_loss': running_train_loss / (train_progress_bar.n + 1)})
 
         model.eval()
         running_val_loss = 0.0
-        val_progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Validation]")
+        val_progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Validation]", disable=(local_rank != 0))
+
         with torch.no_grad():
             for messy_imgs, neat_imgs in val_progress_bar:
-                messy_imgs, neat_imgs = messy_imgs.to(device), neat_imgs.to(device)
-                outputs = model(messy_imgs)
-                loss = criterion(outputs, neat_imgs)
-                running_val_loss += loss.item()
-                val_progress_bar.set_postfix({'val_loss': running_val_loss / (val_progress_bar.n + 1)})
+                messy_imgs, neat_imgs = messy_imgs.to(device, non_blocking=True), neat_imgs.to(device, non_blocking=True)
 
-        avg_train_loss = running_train_loss / len(train_loader)
-        avg_val_loss = running_val_loss / len(val_loader)
-        
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} -> Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+                with autocast():
+                    outputs = model(messy_imgs)
+                    loss = criterion(outputs, neat_imgs)
+
+                running_val_loss += loss.item()
+                if local_rank == 0:
+                    val_progress_bar.set_postfix({'val_loss': running_val_loss / (val_progress_bar.n + 1)})
+
+        avg_train_loss_proc = running_train_loss / len(train_loader)
+        avg_val_loss_proc = running_val_loss / len(val_loader)
+
+        train_loss_tensor = torch.tensor(avg_train_loss_proc).to(device)
+        val_loss_tensor = torch.tensor(avg_val_loss_proc).to(device)
+
+        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+
+        avg_train_loss = train_loss_tensor.item() / world_size
+        avg_val_loss = val_loss_tensor.item() / world_size
+
+        if local_rank == 0:
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS} -> Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
 
         scheduler.step(avg_val_loss)
 
-        if avg_val_loss < best_val_loss:
+        if avg_val_loss < best_val_loss and local_rank == 0:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), VIT_PATH)
-            print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+            torch.save(model.module.state_dict(), VIT_PATH)
+            if local_rank == 0:
+                print(f"New best model saved with validation loss: {best_val_loss:.4f}")
 
-    print("\nLoading best model for final testing...")
-    model.load_state_dict(torch.load(VIT_PATH))
+    if local_rank == 0:
+        print("\nLoading best model for final testing...")
+
+    dist.barrier()
+    model.module.load_state_dict(torch.load(VIT_PATH, map_location=device))
     model.eval()
-
     test_loss = 0.0
-    test_progress_bar = tqdm(test_loader, desc="[Final Test]")
+    test_progress_bar = tqdm(test_loader, desc="[Final Test]", disable=(local_rank != 0))
 
     with torch.no_grad():
         for messy_imgs, neat_imgs in test_progress_bar:
-            messy_imgs, neat_imgs = messy_imgs.to(device), neat_imgs.to(device)
-            
+            messy_imgs, neat_imgs = messy_imgs.to(device, non_blocking=True), neat_imgs.to(device, non_blocking=True)
+
             with autocast():
                 outputs = model(messy_imgs)
                 loss = criterion(outputs, neat_imgs)
-            
+
             test_loss += loss.item()
 
-    avg_test_loss = test_loss / len(test_loader)
-    print(f"Final performance on the test set -> Test Loss: {avg_test_loss:.4f}")
+    avg_test_loss_proc = test_loss / len(test_loader)
+    test_loss_tensor = torch.tensor(avg_test_loss_proc).to(device)
+    dist.all_reduce(test_loss_tensor, op=dist.ReduceOp.SUM)
+    avg_test_loss = test_loss_tensor.item() / world_size
+
+    if local_rank == 0:
+        print(f"Final performance on the test set -> Test Loss: {avg_test_loss:.4f}")
+
+    dist.destroy_process_group()
