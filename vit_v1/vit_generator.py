@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 NUM_EPOCHS = 16
 NUM_WORKERS = 8
 
@@ -66,10 +66,11 @@ class ViT(nn.Module):
     def __init__(self, vit_model_name='facebook/dinov2-large'):
         super().__init__()
 
-        self.vit = ViTModel.from_pretrained(vit_model_name)
-        self.encoder = self.vit.encoder
-        self.embeddings = self.vit.embeddings
-        hidden_size = self.vit.config.hidden_size
+        vit_model = ViTModel.from_pretrained(vit_model_name)
+
+        self.encoder = vit_model.encoder
+        self.embeddings = vit_model.embeddings
+        hidden_size = vit_model.config.hidden_size
 
         self.decoder = nn.Sequential(
             nn.Conv2d(hidden_size, 512, kernel_size=1),
@@ -121,8 +122,8 @@ class WeightedL1Loss(nn.Module):
         return loss.mean()
 
 if __name__ == '__main__':
-    dist.init_process_group("nccl")
     local_rank = int(os.environ['LOCAL_RANK'])
+    dist.init_process_group("nccl", device_id=local_rank)
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)

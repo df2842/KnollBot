@@ -18,26 +18,27 @@ OUTPUT_DIR = os.path.join(SCRIPT_DIR, OUTPUT_DIR_NAME)
 IMAGE_SIZE = 518
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
- 
+
 class ViT(nn.Module):
     def __init__(self, vit_model_name='facebook/dinov2-large'):
         super().__init__()
 
-        self.vit = ViTModel.from_pretrained(vit_model_name)
-        self.encoder = self.vit.encoder
-        self.embeddings = self.vit.embeddings
-        hidden_size = self.vit.config.hidden_size
+        vit_model = ViTModel.from_pretrained(vit_model_name)
+
+        self.encoder = vit_model.encoder
+        self.embeddings = vit_model.embeddings
+        hidden_size = vit_model.config.hidden_size
 
         self.decoder = nn.Sequential(
             nn.Conv2d(hidden_size, 512, kernel_size=1),
             nn.BatchNorm2d(512),
             nn.GELU(),
-            
+
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.GELU(),
-            
+
             nn.Upsample(scale_factor=7, mode='bilinear', align_corners=True),
             nn.Conv2d(256, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
@@ -46,7 +47,7 @@ class ViT(nn.Module):
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            
+
             nn.Conv2d(64, 3, kernel_size=3, padding=1),
             nn.Tanh()
         )
@@ -60,7 +61,7 @@ class ViT(nn.Module):
         num_patches_side = int((sequence_output.shape[1] - 1) ** 0.5)
         hidden_size = sequence_output.shape[2]
         decoder_input = sequence_output[:, 1:].permute(0, 2, 1).reshape(batch_size, hidden_size, num_patches_side, num_patches_side)
-        
+
         return self.decoder(decoder_input)
 
 if __name__ == '__main__':
