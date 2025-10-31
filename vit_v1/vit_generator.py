@@ -15,9 +15,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-BATCH_SIZE = 4
+BATCH_SIZE = 32
 NUM_EPOCHS = 16
-NUM_WORKERS = 6
+NUM_WORKERS = 8
 
 IMAGE_SIZE = 518
 TOOL_WEIGHT = 50
@@ -63,7 +63,7 @@ class ImagePairDataset(Dataset):
         return messy_image, neat_image
 
 class ViT(nn.Module):
-    def __init__(self, vit_model_name='facebook/dinov2-base'):
+    def __init__(self, vit_model_name='facebook/dinov2-large'):
         super().__init__()
 
         self.vit = ViTModel.from_pretrained(vit_model_name)
