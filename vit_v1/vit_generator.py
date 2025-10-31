@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import autocast, GradScaler
 import warnings
 from transformers import ViTModel
@@ -15,15 +14,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-BATCH_SIZE = 8
+BATCH_SIZE = 10
 NUM_EPOCHS = 16
-NUM_WORKERS = 8
+NUM_WORKERS = 12
 
 IMAGE_SIZE = 518
 TOOL_WEIGHT = 50
 LR = 1e-4
-OPTIMIZER_PATIENCE = 3
-OPTIMIZER_FACTOR = 0.1
 
 MESSY_DIR_NAME = 'messy'
 NEAT_DIR_NAME = 'neat'
@@ -161,9 +158,10 @@ if __name__ == '__main__':
 
     model = ViT().to(device)
     model = DDP(model, device_ids=[local_rank])
+    model = torch.compile(model)
     criterion = WeightedL1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=LR)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=OPTIMIZER_PATIENCE, factor=OPTIMIZER_FACTOR)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = GradScaler()
     best_val_loss = float('inf')
 
@@ -223,7 +221,7 @@ if __name__ == '__main__':
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{NUM_EPOCHS} -> Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
 
-        scheduler.step(avg_val_loss)
+        scheduler.step()
 
         if avg_val_loss < best_val_loss and local_rank == 0:
             best_val_loss = avg_val_loss
