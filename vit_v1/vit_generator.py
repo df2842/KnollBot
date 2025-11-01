@@ -20,7 +20,7 @@ NUM_WORKERS = 16
 
 IMAGE_SIZE = 518
 TOOL_WEIGHT = 50
-LR = 1e-4
+LR = 1e-5
 
 MESSY_DIR_NAME = 'messy'
 NEAT_DIR_NAME = 'neat'
@@ -110,12 +110,10 @@ class WeightedL1Loss(nn.Module):
         self.weight = weight
 
     def forward(self, outputs, targets):
-        mask = (targets.mean(dim=1, keepdim=True) < 0.99).float()
-        
-        weights = 1.0 + mask * (self.weight - 1.0)
-        
+        background_mask = (targets.mean(dim=1, keepdim=True) > 0.95).float()
+        tool_mask = 1.0 - background_mask
+        weights = 1.0 + tool_mask * (self.weight - 1.0)
         loss = torch.abs(outputs - targets) * weights
-        
         return loss.mean()
 
 if __name__ == '__main__':
@@ -183,6 +181,8 @@ if __name__ == '__main__':
                 loss = criterion(outputs, neat_imgs)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
