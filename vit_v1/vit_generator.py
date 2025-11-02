@@ -21,6 +21,7 @@ NUM_WORKERS = 16
 IMAGE_SIZE = 518
 TOOL_WEIGHT = 50
 LR = 1e-5
+WEIGHT_DECAY = 1e-2
 
 MESSY_DIR_NAME = 'messy'
 NEAT_DIR_NAME = 'neat'
@@ -104,7 +105,7 @@ class ViT(nn.Module):
         
         return self.decoder(decoder_input)
 
-class WeightedL1Loss(nn.Module):
+class WeightedL2Loss(nn.Module):
     def __init__(self, weight=TOOL_WEIGHT):
         super().__init__()
         self.weight = weight
@@ -113,7 +114,7 @@ class WeightedL1Loss(nn.Module):
         background_mask = (targets.mean(dim=1, keepdim=True) > 0.95).float()
         tool_mask = 1.0 - background_mask
         weights = 1.0 + tool_mask * (self.weight - 1.0)
-        loss = torch.abs(outputs - targets) * weights
+        loss = torch.pow(outputs - targets, 2) * weights
         return loss.mean()
 
 if __name__ == '__main__':
@@ -136,15 +137,22 @@ if __name__ == '__main__':
     dist.broadcast_object_list(val_files, src=0)
     dist.broadcast_object_list(test_files, src=0)
 
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+    val_test_transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-    train_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=train_files, transform=transform)
-    val_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=val_files, transform=transform)
-    test_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=test_files, transform=transform)
+    train_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=train_files, transform=train_transform)
+    val_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=val_files, transform=val_test_transform)
+    test_dataset = ImagePairDataset(MESSY_DIR, NEAT_DIR, image_files=test_files, transform=val_test_transform)
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -157,8 +165,8 @@ if __name__ == '__main__':
     model = ViT().to(device)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)
-    criterion = WeightedL1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=LR)
+    criterion = WeightedL2Loss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = GradScaler()
     best_val_loss = float('inf')
